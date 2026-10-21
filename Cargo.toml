@@ -1,0 +1,47 @@
+[package]
+name = "agents-dashboard"
+version = "0.5.5"
+edition = "2021"
+rust-version = "1.88"
+description = "Agents Dashboard: AI agent quota and session monitor for your terminal"
+license = "MIT"
+repository = "https://github.com/ahnchiwan/agents-dashboard"
+homepage = "https://github.com/ahnchiwan/agents-dashboard"
+keywords = ["tui", "monitor", "claude", "ai", "agent"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+authors = ["Tae Hwan Jung <nlkey2022@gmail.com>", "ahnchiwan <chiwan9@gmail.com>"]
+exclude = ["docs/images/*"]
+
+[lib]
+# Keep the library crate name so in-process consumers keep compiling.
+name = "abtop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agents-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
+unicode-width = "0.2"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+proc_pidinfo = "0.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sysinfo = "0.32"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
