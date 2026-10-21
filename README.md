@@ -44,11 +44,11 @@ Notes:
 
 - This fork has no prebuilt binaries, crates.io releases, or Homebrew formula; build it from source as above. The upstream installer scripts and `cargo install abtop` install the original `abtop`, not this fork.
 - To update, run `git pull` and `cargo install --path .` again in your checkout. `agents-dashboard --update` only prints these steps; it downloads and runs nothing.
-- This fork is developed and used on Linux (WSL2). The live dashboard inherits upstream's macOS and Windows support, which is not re-verified here.
+- This fork is developed for use in WSL2 (Linux). macOS is expected to work but has not been verified. Native Windows is not supported; use WSL2 on Windows.
 
 ## Quick start
 
-1. **Start tmux and run the dashboard inside it.** The live dashboard works anywhere, but Old Sessions and New Session open sessions in a new window of the dashboard's own tmux session and report an error when it runs outside tmux.
+1. **Start tmux and run the dashboard inside it.** The live dashboard can run outside tmux, but Old Sessions and New Session open sessions in a new window of the dashboard's own tmux session and report an error when it runs outside tmux.
 
    ```bash
    tmux new -s work
