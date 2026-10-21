@@ -6,7 +6,7 @@ This project is a fork of [graykode/abtop](https://github.com/graykode/abtop) (M
 
 ![Agents Dashboard tab](docs/images/dashboard.png)
 
-> Screenshots use the built-in demo data (`agents-dashboard --demo`), the `light` theme, and fixture sessions with anonymized paths.
+> Screenshots use the built-in demo data (`agents-dashboard --demo`), the default dark `btop` theme, and fixture sessions with anonymized paths.
 
 ## Features
 
