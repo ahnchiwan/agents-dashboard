@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::archive::{display, Agent};
+use crate::collector::{redact_secrets, sanitize_terminal_text};
 use crate::workspace::MainTab;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -130,7 +131,42 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Rect::new(body.x, body.y + body.height - 5, body.width, 1),
             );
         }
-        if let Some(session) = visible.get(ws.selected) {
+        if let Some(resume) = &ws.resume {
+            let detail = [
+                Line::from(format!(
+                    "ID: {}",
+                    resume.request.resume.as_deref().unwrap_or_default()
+                )),
+                Line::from(format!(
+                    "Original CWD: {}",
+                    display(&resume.request.cwd.to_string_lossy())
+                )),
+                Line::from(format!(
+                    "New path: {}▏",
+                    redact_secrets(&sanitize_terminal_text(&resume.path))
+                )),
+                Line::from(format!(
+                    "Config: {}",
+                    display(&resume.request.root.to_string_lossy())
+                )),
+            ];
+            for (row, line) in detail.into_iter().enumerate().take(body.height as usize) {
+                let scroll = if row == 2 {
+                    line.width().saturating_sub(body.width as usize)
+                } else {
+                    0
+                };
+                f.render_widget(
+                    Paragraph::new(line).scroll((0, scroll.min(u16::MAX as usize) as u16)),
+                    Rect::new(
+                        body.x,
+                        body.y + body.height.saturating_sub(4) + row as u16,
+                        body.width,
+                        1,
+                    ),
+                );
+            }
+        } else if let Some(session) = visible.get(ws.selected) {
             let detail = vec![
                 Line::from(format!("ID: {}", session.id)),
                 Line::from(format!(
@@ -139,7 +175,7 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect) {
                     if session.cwd.is_dir() {
                         ""
                     } else {
-                        " [missing/deleted; resume disabled]"
+                        " [unavailable; Enter to choose a new path]"
                     }
                 )),
                 Line::from(format!(
@@ -287,6 +323,45 @@ mod tests {
                 !cell.modifier.intersects(Modifier::DIM | Modifier::BOLD),
                 "at ({x}, {y})"
             );
+        }
+    }
+
+    #[test]
+    fn archive_path_prompt_shows_frozen_session_and_keeps_long_path_cursor_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.workspace.tab = MainTab::Old;
+        app.workspace.archive.push(crate::archive::ArchivedSession {
+            agent: Agent::Claude,
+            id: "moved-session".into(),
+            title: "Moved project".into(),
+            cwd: temp.path().join("missing"),
+            root: temp.path().into(),
+            modified: 0,
+        });
+        app.workspace
+            .handle_key(crossterm::event::KeyCode::Enter, &[], false);
+        let buffer = render(&app);
+        for text in [
+            "Original CWD:",
+            "New path:",
+            "ID: moved-session",
+            "resume here",
+            "cancel edit",
+        ] {
+            text_position(&buffer, text);
+        }
+        app.workspace.resume.as_mut().unwrap().path = format!("/{}path-end", "project/".repeat(50));
+        app.workspace.archive.clear();
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            terminal.draw(|f| super::super::draw(f, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            text_position(buffer, "ID: moved-session");
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("path-end▏"), "width {width}: {text}");
+            let footer: String = (0..width).map(|x| buffer[(x, 17)].symbol()).collect();
+            assert!(!footer.contains("quit"));
         }
     }
 

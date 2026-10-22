@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone)]
 pub struct LaunchRequest {
     pub agent: Agent,
     pub cwd: PathBuf,

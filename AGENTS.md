@@ -79,6 +79,7 @@ The top-level tabs are **Agents Dashboard**, **Session Archive**, and **New Sess
 - **quota**: Claude + Codex rate limit gauges (5h and 7d windows with reset times) plus total tokens and token rate. Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - `1` / `2` hide or show the quota / sessions panels. Below 100 columns the dashboard switches to a compact layout with **Work** / **Usage** tabs. Below 60x18 it shows a "terminal too small" message.
 - The tab header is black on the light themes and uses the theme's title color on dark themes. The Session Archive / New Session screens use fixed accent colors.
+- Archive resume uses the recorded cwd when available; otherwise it prompts for an existing absolute replacement path (`~/...` supported). The pending request keeps the original session ID and config root across background scans. `Esc` or a tab switch cancels; replacement paths are never written back to archive metadata.
 
 ## Data Sources
 

@@ -327,7 +327,10 @@ fn handle_key_press(
         return;
     }
     if app.workspace.tab != workspace::MainTab::Dashboard {
-        if key.code == KeyCode::Char('q') && !app.workspace.searching && !app.workspace.new.editing
+        if key.code == KeyCode::Char('q')
+            && !app.workspace.searching
+            && !app.workspace.new.editing
+            && app.workspace.resume.is_none()
         {
             app.quit();
         } else {
@@ -668,6 +671,47 @@ mod tests {
         assert!(text.contains("cmux: socket broken; restart cmux"));
         assert!(!text.contains("Broken pipe"));
         assert!(!text.contains("select-workspace"));
+    }
+
+    #[test]
+    fn archive_path_edit_accepts_q_and_tab_cancels_without_quitting() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_config(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        app.workspace.tab = workspace::MainTab::Old;
+        app.workspace.loaded = true;
+        app.workspace.archive.push(archive::ArchivedSession {
+            agent: archive::Agent::Claude,
+            id: "archived-session".into(),
+            title: "Moved project".into(),
+            cwd: temp.path().join("missing"),
+            root: temp.path().into(),
+            modified: 0,
+        });
+        let press = |app: &mut App, code| {
+            handle_key_press(
+                app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                false,
+                false,
+                |_| panic!("Archive must not jump to a live session"),
+            )
+        };
+        press(&mut app, KeyCode::Enter);
+        let path = app.workspace.resume.as_ref().unwrap().path.clone();
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(
+            app.workspace.resume.as_ref().unwrap().path,
+            format!("{path}q")
+        );
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.workspace.tab, workspace::MainTab::Dashboard);
+        assert!(app.workspace.resume.is_none());
+        assert!(!app.should_quit);
     }
 
     #[test]

@@ -22,7 +22,9 @@ pub(super) fn key_hint(key: &str, description: &str, theme: &Theme) -> [Span<'st
 pub(super) fn draw_workspace_footer(f: &mut Frame, app: &App, area: Rect) {
     let compact = area.width <= 80;
     let ultra_compact = area.width <= 70;
-    let hints = if app.workspace.tab == crate::workspace::MainTab::Old && app.workspace.searching {
+    let hints = if app.workspace.resume.is_some() {
+        vec![(" ↵", "resume here"), ("Esc", "cancel edit")]
+    } else if app.workspace.tab == crate::workspace::MainTab::Old && app.workspace.searching {
         vec![(" ↵", "accept search"), ("Esc", "clear search")]
     } else if app.workspace.tab == crate::workspace::MainTab::Old {
         let mut hints = vec![
@@ -53,7 +55,7 @@ pub(super) fn draw_workspace_footer(f: &mut Frame, app: &App, area: Rect) {
         "tabs",
         &app.theme,
     ));
-    if !app.workspace.new.editing && !app.workspace.searching {
+    if !app.workspace.new.editing && !app.workspace.searching && app.workspace.resume.is_none() {
         spans.extend(key_hint("q", "quit", &app.theme));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

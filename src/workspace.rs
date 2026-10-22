@@ -62,6 +62,11 @@ impl Default for NewSession {
     }
 }
 
+pub(crate) struct ArchiveResume {
+    pub request: LaunchRequest,
+    pub path: String,
+}
+
 #[derive(Default)]
 pub struct Workspace {
     pub tab: MainTab,
@@ -76,6 +81,7 @@ pub struct Workspace {
     pub message: String,
     pub new: NewSession,
     pub claude_dirs: Vec<PathBuf>,
+    pub(crate) resume: Option<ArchiveResume>,
     receiver: Option<Receiver<ScanResult>>,
 }
 
@@ -93,6 +99,9 @@ impl Workspace {
     pub fn set_tab(&mut self, tab: MainTab, live: &[AgentSession]) {
         self.tab = tab;
         self.searching = false;
+        if self.resume.take().is_some() {
+            self.message.clear();
+        }
         if self.new.editing {
             self.new.path = self.new.original_path.clone();
         }
@@ -186,7 +195,49 @@ impl Workspace {
             .unwrap_or(self.new.projects.len());
     }
     pub fn handle_key(&mut self, code: KeyCode, live: &[AgentSession], demo: bool) {
+        self.handle_key_with(code, live, demo, launcher::launch);
+    }
+    fn handle_key_with(
+        &mut self,
+        code: KeyCode,
+        live: &[AgentSession],
+        demo: bool,
+        mut launch: impl FnMut(&LaunchRequest) -> Result<(), String>,
+    ) {
         if self.tab == MainTab::Old {
+            if let Some(resume) = &mut self.resume {
+                match code {
+                    KeyCode::Esc => {
+                        self.resume = None;
+                        self.message.clear();
+                    }
+                    KeyCode::Enter if !demo => {
+                        let cwd = expand_home(&resume.path);
+                        if !cwd.is_absolute() || !cwd.is_dir() {
+                            self.message =
+                                "Choose an existing absolute directory (or ~/...).".into();
+                            return;
+                        }
+                        let mut request = resume.request.clone();
+                        request.cwd = cwd;
+                        self.message = match launch(&request) {
+                            Ok(()) => {
+                                self.resume = None;
+                                format!("Opened {} window.", request.agent.label())
+                            }
+                            Err(error) => error,
+                        };
+                    }
+                    KeyCode::Backspace => {
+                        resume.path.pop();
+                    }
+                    KeyCode::Char(c) if !c.is_control() && resume.path.len() < 4096 => {
+                        resume.path.push(c);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if self.searching {
                 match code {
                     KeyCode::Esc => {
@@ -233,7 +284,15 @@ impl Workspace {
                         .get(self.selected)
                         .map(|s| LaunchRequest::from(*s));
                     if let Some(request) = request {
-                        self.launch(request);
+                        if !request.cwd.is_absolute() || !request.cwd.is_dir() {
+                            self.resume = Some(ArchiveResume {
+                                path: request.cwd.to_string_lossy().into_owned(),
+                                request,
+                            });
+                            self.message = "Original working directory is unavailable; enter its new location.".into();
+                        } else {
+                            self.launch(request, &mut launch);
+                        }
                     }
                 }
                 _ => {}
@@ -274,21 +333,28 @@ impl Workspace {
                 }
                 KeyCode::Enter if self.new.field == 3 && !demo => {
                     let cwd = expand_home(&self.new.path);
-                    self.launch(LaunchRequest {
-                        agent: self.new.agent,
-                        cwd,
-                        root: archive::default_root(self.new.agent),
-                        resume: None,
-                        model: (self.new.model > 0)
-                            .then(|| self.new.models[self.new.model].clone()),
-                    });
+                    self.launch(
+                        LaunchRequest {
+                            agent: self.new.agent,
+                            cwd,
+                            root: archive::default_root(self.new.agent),
+                            resume: None,
+                            model: (self.new.model > 0)
+                                .then(|| self.new.models[self.new.model].clone()),
+                        },
+                        &mut launch,
+                    );
                 }
                 _ => {}
             }
         }
     }
-    fn launch(&mut self, request: LaunchRequest) {
-        self.message = match launcher::launch(&request) {
+    fn launch(
+        &mut self,
+        request: LaunchRequest,
+        mut launch: impl FnMut(&LaunchRequest) -> Result<(), String>,
+    ) {
+        self.message = match launch(&request) {
             Ok(()) => format!("Opened {} window.", request.agent.label()),
             Err(error) => error,
         };
@@ -618,6 +684,159 @@ impl NewSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn archive_workspace(agent: Agent, cwd: &Path, root: &Path) -> Workspace {
+        Workspace {
+            tab: MainTab::Old,
+            loaded: true,
+            archive: vec![ArchivedSession {
+                agent,
+                id: "archived-session".into(),
+                title: "Archived work".into(),
+                cwd: cwd.into(),
+                root: root.into(),
+                modified: 0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn archive_existing_directory_resumes_without_path_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        for agent in [Agent::Claude, Agent::Codex] {
+            let mut workspace = archive_workspace(agent, temp.path(), temp.path());
+            let mut calls = 0;
+            workspace.handle_key_with(KeyCode::Enter, &[], false, |request| {
+                calls += 1;
+                assert_eq!(request.agent, agent);
+                assert_eq!(request.cwd, temp.path());
+                assert_eq!(request.root, temp.path());
+                assert_eq!(request.resume.as_deref(), Some("archived-session"));
+                assert!(request.model.is_none());
+                Ok(())
+            });
+            assert_eq!(calls, 1);
+            assert!(workspace.resume.is_none());
+        }
+    }
+
+    #[test]
+    fn archive_missing_directory_prompts_and_resumes_frozen_session_at_new_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("moved");
+        let replacement = temp.path().join("new project");
+        std::fs::create_dir(&replacement).unwrap();
+        for agent in [Agent::Claude, Agent::Codex] {
+            let mut workspace = archive_workspace(agent, &missing, temp.path());
+            workspace.handle_key_with(KeyCode::Enter, &[], false, |_| panic!("Must prompt first"));
+            assert_eq!(
+                workspace.resume.as_ref().unwrap().path,
+                missing.to_string_lossy()
+            );
+            for _ in missing.to_string_lossy().chars() {
+                workspace.handle_key(KeyCode::Backspace, &[], false);
+            }
+            for c in replacement.to_string_lossy().chars() {
+                workspace.handle_key(KeyCode::Char(c), &[], false);
+            }
+            // A background scan may replace the list while the prompt is open.
+            workspace.archive.clear();
+            let mut calls = 0;
+            workspace.handle_key_with(KeyCode::Enter, &[], false, |request| {
+                calls += 1;
+                assert_eq!(request.agent, agent);
+                assert_eq!(request.cwd, replacement);
+                assert_eq!(request.root, temp.path());
+                assert_eq!(request.resume.as_deref(), Some("archived-session"));
+                assert!(request.model.is_none());
+                Ok(())
+            });
+            assert_eq!(calls, 1);
+            assert!(workspace.resume.is_none());
+            assert_eq!(
+                workspace.message,
+                format!("Opened {} window.", agent.label())
+            );
+        }
+    }
+
+    #[test]
+    fn archive_replacement_rejects_invalid_paths_and_keeps_original_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("moved");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let root = temp.path().join("missing-config");
+        let mut workspace = archive_workspace(Agent::Claude, &missing, &root);
+        workspace.handle_key(KeyCode::Enter, &[], false);
+        for path in [
+            String::new(),
+            "relative".into(),
+            missing.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+        ] {
+            workspace.resume.as_mut().unwrap().path = path;
+            workspace.handle_key_with(KeyCode::Enter, &[], false, |_| panic!("Invalid path"));
+            assert!(workspace.message.contains("existing absolute directory"));
+            assert!(workspace.resume.is_some());
+        }
+        workspace.resume.as_mut().unwrap().path = temp.path().to_string_lossy().into_owned();
+        workspace.handle_key(KeyCode::Enter, &[], false);
+        assert!(workspace.message.contains("config root"));
+        assert_eq!(workspace.resume.as_ref().unwrap().request.root, root);
+        assert_eq!(workspace.resume.as_ref().unwrap().request.cwd, missing);
+        assert_eq!(workspace.archive[0].cwd, missing);
+    }
+
+    #[test]
+    fn archive_replacement_accepts_home_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace =
+            archive_workspace(Agent::Claude, &temp.path().join("moved"), temp.path());
+        workspace.handle_key(KeyCode::Enter, &[], false);
+        workspace.resume.as_mut().unwrap().path = "~/".into();
+        let mut calls = 0;
+        workspace.handle_key_with(KeyCode::Enter, &[], false, |request| {
+            calls += 1;
+            assert_eq!(request.cwd, dirs::home_dir().unwrap());
+            Ok(())
+        });
+        assert_eq!(calls, 1);
+        assert!(workspace.resume.is_none());
+    }
+
+    #[test]
+    fn archive_path_prompt_cancels_without_launching_or_changing_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("moved");
+        let mut workspace = archive_workspace(Agent::Claude, &missing, temp.path());
+        workspace.handle_key_with(KeyCode::Enter, &[], true, |_| {
+            panic!("Demo must not launch")
+        });
+        assert!(workspace.resume.is_none());
+        workspace.handle_key(KeyCode::Enter, &[], false);
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('/'),
+            KeyCode::Char('r'),
+            KeyCode::Down,
+        ] {
+            workspace.handle_key(code, &[], false);
+        }
+        assert!(!workspace.searching);
+        assert!(!workspace.loading);
+        assert_eq!(workspace.selected, 0);
+        workspace.handle_key_with(KeyCode::Esc, &[], false, |_| panic!("Cancelled"));
+        assert!(workspace.resume.is_none());
+        assert!(workspace.message.is_empty());
+        assert_eq!(workspace.archive[0].cwd, missing);
+        workspace.handle_key(KeyCode::Enter, &[], false);
+        workspace.set_tab(MainTab::Dashboard, &[]);
+        assert!(workspace.resume.is_none());
+        assert!(workspace.message.is_empty());
+    }
+
     #[test]
     fn form_navigation_requires_create_button_and_escape_restores_edit() {
         let mut workspace = Workspace {
