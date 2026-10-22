@@ -13,7 +13,7 @@ This project is a fork of [graykode/abtop](https://github.com/graykode/abtop) (M
 - **Live sessions** for Claude Code, Codex CLI, and OpenCode: status (`Working`, `Reply`, `Wait`, `Done`), model, context window %, and token totals. A session that is waiting for your answer or a permission decision is flagged `Reply`.
 - **Quota panel** with the Claude and Codex 5-hour and 7-day windows.
 - **Chat history** for the selected session: recent user and assistant messages plus the tool calls and results between them, read-only, bounded, and redacted.
-- **Old Sessions**: browse past Claude and Codex sessions and resume one in a new tmux window.
+- **Session Archive**: browse past Claude and Codex sessions and resume one in a new tmux window.
 - **New Session**: choose an agent, a model, and a path, then start it in a new tmux window.
 - **Terminal jump**: `Enter` focuses the terminal running the selected session (cmux, tmux, iTerm2).
 - 12 themes (including colorblind-friendly ones), a JSON snapshot for scripts, and a small library API.
@@ -27,7 +27,7 @@ Requirements:
 | Requirement | Needed for |
 | --- | --- |
 | Rust 1.88 or newer | Building from source |
-| `tmux` | Old Sessions, New Session, and tmux terminal jump |
+| `tmux` | Session Archive, New Session, and tmux terminal jump |
 | `claude` and/or `codex` on `PATH` | Starting or resuming sessions from the dashboard; `ocx` (OpenCodex) is optional and preferred for Claude when present (see [Launching sessions](#launching-sessions)) |
 | `sqlite3` | OpenCode session discovery on Linux |
 | `jq` | The optional Claude `Reply` hook (see [Reply detection](#reply-detection-for-claude-permission-prompts)) |
@@ -48,7 +48,7 @@ Notes:
 
 ## Quick start
 
-1. **Start tmux and run the dashboard inside it.** The live dashboard can run outside tmux, but Old Sessions and New Session open sessions in a new window of the dashboard's own tmux session and report an error when it runs outside tmux.
+1. **Start tmux and run the dashboard inside it.** The live dashboard can run outside tmux, but Session Archive and New Session open sessions in a new window of the dashboard's own tmux session and report an error when it runs outside tmux.
 
    ```bash
    tmux new -s work
@@ -67,7 +67,7 @@ Notes:
 
 3. **Optionally enable `Reply` for Claude permission prompts** with the hook in [Reply detection](#reply-detection-for-claude-permission-prompts). Questions are detected without it.
 
-4. **Use the tabs.** Press `Tab` to move between **Agents Dashboard** (live sessions), **Old Sessions** (resume with `Enter`), and **New Session** (pick agent, model, and path, then `Enter` on **Create session**). On a live session, `Enter` jumps to its terminal and `PgUp` / `PgDn` scroll its chat history. Press `?` for help and `q` to quit. All keys are listed in [Key bindings](#key-bindings).
+4. **Use the tabs.** Press `Tab` to move between **Agents Dashboard** (live sessions), **Session Archive** (resume with `Enter`), and **New Session** (pick agent, model, and path, then `Enter` on **Create session**). On a live session, `Enter` jumps to its terminal and `PgUp` / `PgDn` scroll its chat history. Press `?` for help and `q` to quit. All keys are listed in [Key bindings](#key-bindings).
 
 ## Usage
 
@@ -89,11 +89,11 @@ Recommended terminal size: **120x40** or larger. Below 100 columns the dashboard
 
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` to enable tab clicks and wheel navigation. `--no-mouse` is also accepted; if both flags occur, the last one wins.
 
-All themes apply to the Agents Dashboard tab and the tab header. Old Sessions and New Session use fixed accent colors (green and blue borders, light selection rows) on every theme, and `t` works only in the Agents Dashboard tab.
+All themes apply to the Agents Dashboard tab and the tab header. Session Archive and New Session use fixed accent colors (green and blue borders, light selection rows) on every theme, and `t` works only in the Agents Dashboard tab.
 
 ## Tabs
 
-The top-level tabs are **Agents Dashboard**, **Old Sessions**, and **New Session**. Use `Tab` / `Shift+Tab` to cycle them (or click a tab when launched with `--mouse`). In compact mode, `←` / `→` select **Work** / **Usage** inside Agents Dashboard.
+The top-level tabs are **Agents Dashboard**, **Session Archive**, and **New Session**. Use `Tab` / `Shift+Tab` to cycle them (or click a tab when launched with `--mouse`). In compact mode, `←` / `→` select **Work** / **Usage** inside Agents Dashboard.
 
 ### Agents Dashboard
 
@@ -109,15 +109,15 @@ This is a compact activity view, not a terminal replica: it does not reproduce t
 - Everything shown is terminal-sanitized and passed through secret redaction (known token prefixes only).
 - Codex rollouts that use the newer `item_completed` schema show tool calls only (operation and path), because the collector deliberately reads no command text or output from that schema.
 
-### Old Sessions
+### Session Archive
 
-![Old Sessions tab](docs/images/old-sessions.png)
+![Session Archive tab](docs/images/old-sessions.png)
 
 Lists historical Claude and Codex main sessions, newest transcript modification first. Live sessions are excluded. Use `/` to search titles, IDs, working directories, or config roots (`Enter` accepts the search, `Esc` clears it), `←` / `→` to cycle the All / Claude / Codex filter, `↑` / `↓` to select, and `r` to refresh in the background.
 
 `Enter` opens a **new window in the dashboard's current tmux session** and resumes the selected session there (`claude --resume ID` or `codex resume ID -C CWD`). It never splits a pane. The original working directory and config root (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) are retained. A missing working directory or config root, an unavailable executable, or running outside tmux produces an error instead of falling back to another directory or profile.
 
-History is scanned when you first enter Old Sessions or New Session and is cached separately. It is never added to live token totals, quota, summaries, or JSON snapshots. Discovery reads Claude `projects/*/*.jsonl` and Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`, excluding subagents. Each transcript is sampled at its first and last 64 KiB, and discovery examines at most 100,000 directory entries and parses the newest 20,000 files; the UI indicates when a limit is reached. Helper sessions such as title generators are hidden.
+History is scanned when you first enter Session Archive or New Session and is cached separately. It is never added to live token totals, quota, summaries, or JSON snapshots. Discovery reads Claude `projects/*/*.jsonl` and Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`, excluding subagents. Each transcript is sampled at its first and last 64 KiB, and discovery examines at most 100,000 directory entries and parses the newest 20,000 files; the UI indicates when a limit is reached. Helper sessions such as title generators are hidden.
 
 ### New Session
 

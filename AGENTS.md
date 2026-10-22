@@ -21,7 +21,7 @@ src/
 ├── main.rs                 # Binary entry; calls abtop::run()
 ├── lib.rs                  # CLI flags, terminal setup, event loop, key/mouse handling, --once output
 ├── app.rs                  # App state, tick logic, summary generation (--once only)
-├── workspace.rs            # Old Sessions / New Session tab state and model catalogs
+├── workspace.rs            # Session Archive / New Session tab state and model catalogs
 ├── archive.rs              # Historical Claude/Codex session discovery (background scan)
 ├── launcher.rs             # tmux new-window launcher for resume/new sessions
 ├── chat_view.rs            # Chat history layout and scroll anchoring
@@ -33,7 +33,7 @@ src/
 │   ├── header.rs           # Top-level tab header
 │   ├── quota.rs            # Claude + Codex quota panel
 │   ├── sessions.rs         # Sessions table + selected-session detail (chat, timeline, file audit)
-│   ├── workspace.rs        # Old Sessions / New Session screens
+│   ├── workspace.rs        # Session Archive / New Session screens
 │   └── footer.rs / help.rs / view_menu.rs
 ├── collector/
 │   ├── mod.rs              # MultiCollector orchestration, orphan port detection
@@ -53,10 +53,10 @@ src/
 
 ## Layout
 
-The top-level tabs are **Agents Dashboard**, **Old Sessions**, and **New Session** (`src/workspace.rs`, `src/ui/workspace.rs`). The Agents Dashboard tab at 100 columns or wider:
+The top-level tabs are **Agents Dashboard**, **Session Archive**, and **New Session** (`src/workspace.rs`, `src/ui/workspace.rs`). The Agents Dashboard tab at 100 columns or wider:
 
 ```
-| Agents Dashboard | Old Sessions | New Session |          <- header (1 row)
+| Agents Dashboard | Session Archive | New Session |          <- header (1 row)
 ┌─ quota ──────────────────────────────────────────────┐
 │ CLAUDE  5h ████ 35% 14:00     7d ██ 12% 10/26 10:00  │   <- 5 rows
 │ CODEX   5h █    9%  15:00     7d ██ 14% 10/27 10:00  │
@@ -78,7 +78,7 @@ The top-level tabs are **Agents Dashboard**, **Old Sessions**, and **New Session
 - The sessions table has one row per session (plus subagent rows in tree view, `T`). Session Name gets one third of the width otherwise available to Model.
 - **quota**: Claude + Codex rate limit gauges (5h and 7d windows with reset times) plus total tokens and token rate. Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - `1` / `2` hide or show the quota / sessions panels. Below 100 columns the dashboard switches to a compact layout with **Work** / **Usage** tabs. Below 60x18 it shows a "terminal too small" message.
-- The tab header is black on the light themes and uses the theme's title color on dark themes. The Old Sessions / New Session screens use fixed accent colors.
+- The tab header is black on the light themes and uses the theme's title color on dark themes. The Session Archive / New Session screens use fixed accent colors.
 
 ## Data Sources
 
@@ -264,7 +264,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 
 ## Key Bindings
 
-The full key table is in the README (Key bindings). Key handling lives in `handle_key_press` in `src/lib.rs`; the Old Sessions / New Session tabs are handled by `Workspace::handle_key` in `src/workspace.rs`. The most used keys:
+The full key table is in the README (Key bindings). Key handling lives in `handle_key_press` in `src/lib.rs`; the Session Archive / New Session tabs are handled by `Workspace::handle_key` in `src/workspace.rs`. The most used keys:
 
 | Key | Action |
 |-----|--------|

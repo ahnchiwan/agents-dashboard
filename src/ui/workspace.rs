@@ -511,7 +511,7 @@ mod tests {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         app.workspace.tab = MainTab::New;
         let buffer = render(&app);
-        let expected = "| Agents Dashboard | Old Sessions | New Session |";
+        let expected = "| Agents Dashboard | Session Archive | New Session |";
         let header: String = (0..expected.len() as u16)
             .map(|x| buffer[(x, 0)].symbol())
             .collect();
@@ -586,7 +586,7 @@ mod tests {
                     .iter()
                     .map(|c| c.symbol())
                     .collect();
-                assert!(text.contains("Old Sessions"));
+                assert!(text.contains("Session Archive"));
                 assert!(text.contains("New Session"));
                 if tab == MainTab::New {
                     assert!(text.contains("Create session"));

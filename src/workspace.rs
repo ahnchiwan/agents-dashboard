@@ -22,7 +22,7 @@ impl MainTab {
     pub fn label(self) -> &'static str {
         match self {
             Self::Dashboard => "Agents Dashboard",
-            Self::Old => "Old Sessions",
+            Self::Old => "Session Archive",
             Self::New => "New Session",
         }
     }
