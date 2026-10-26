@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 ///
 /// Discovery strategy (no PID session file like Claude):
 /// 1. `ps` to find running codex processes
-/// 2. `lsof` to map PID → open rollout-*.jsonl file
+/// 2. Open rollout files for direct writers; session IDs and tmux thread titles
+///    identify terminal clients that delegate writes to a shared daemon
 /// 3. Parse JSONL for session metadata, tokens, tool usage
 ///
 /// JSONL event types:
@@ -35,6 +36,8 @@ pub struct CodexCollector {
     /// seen during the current scan. Their rate limits are still used, but
     /// the sessions themselves are hidden from the sessions panel.
     helper_session_ids: std::cell::RefCell<HashSet<String>>,
+    /// Paths for current clients identified by session ID or terminal title.
+    client_rollout_paths: HashMap<String, PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -78,7 +81,7 @@ fn read_session_names(sessions_dir: &Path) -> HashMap<String, String> {
         ) {
             let clean = super::sanitize_terminal_text(title);
             let clean = super::redact_secrets(&clean);
-            names.insert(id.to_string(), clean.chars().take(200).collect());
+            names.insert(id.to_string(), clean.chars().take(4096).collect());
         }
     }
     names
@@ -136,11 +139,6 @@ impl DesktopRecentRolloutScanner {
 }
 
 impl CodexCollector {
-    pub(crate) fn resolve_live_client_pid_for_cwd(session_cwd: &str) -> Option<u32> {
-        let process_info = process::get_process_info();
-        Self::find_closest_codex_client_pid_for_cwd(&process_info, session_cwd)
-    }
-
     pub fn new() -> Self {
         let home = dirs::home_dir().unwrap_or_default();
         Self {
@@ -151,10 +149,70 @@ impl CodexCollector {
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
             helper_session_ids: Default::default(),
+            client_rollout_paths: HashMap::new(),
         }
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+        let mut names = read_session_names(&self.sessions_dir);
+        #[cfg(target_os = "linux")]
+        let mut startups = Vec::new();
+        // A session-ID terminal title also works before a new thread is named.
+        // Today's filenames provide its full ID without reading chat content.
+        if let Some(today) = Self::today_session_dir(&self.sessions_dir) {
+            if let Ok(entries) = fs::read_dir(today) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".jsonl"))
+                    else {
+                        continue;
+                    };
+                    let Some(id) = stem.get(stem.len().saturating_sub(36)..) else {
+                        continue;
+                    };
+                    if stem.starts_with("rollout-") && super::codex_identity::is_session_id(id) {
+                        names.entry(id.to_string()).or_default();
+                        #[cfg(target_os = "linux")]
+                        if let Some(meta) = read_rollout_metadata(&entry.path()) {
+                            if meta["originator"] == "codex-tui"
+                                && !meta["source"].is_object()
+                                && meta["thread_source"]
+                                    .as_str()
+                                    .is_none_or(|source| source == "user")
+                            {
+                                if let (Some(cwd), Some(start)) = (
+                                    meta["cwd"].as_str(),
+                                    meta["timestamp"].as_str().and_then(|ts| {
+                                        chrono::DateTime::parse_from_rfc3339(ts).ok()
+                                    }),
+                                ) {
+                                    startups.push(super::codex_identity::StartedSession {
+                                        id: id.to_string(),
+                                        cwd: PathBuf::from(cwd),
+                                        started_ms: start.timestamp_millis().max(0) as u64,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let clients = Self::codex_client_pids(&shared.process_info);
+        #[allow(unused_mut)]
+        let mut client_ids =
+            super::codex_identity::discover(&shared.process_info, &clients, &names);
+        #[cfg(target_os = "linux")]
+        super::codex_identity::discover_startups(&clients, &startups, &mut client_ids);
+        self.collect_sessions_with_identity(shared, &names, &client_ids)
+    }
+
+    fn collect_sessions_with_identity(
+        &mut self,
+        shared: &super::SharedProcessData,
+        names: &HashMap<String, String>,
+        client_ids: &HashMap<u32, String>,
+    ) -> Vec<AgentSession> {
         if !self.sessions_dir.exists() {
             self.last_rate_limit = None;
             return vec![];
@@ -169,7 +227,23 @@ impl CodexCollector {
         let codex_pids =
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
-        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        self.client_rollout_paths
+            .retain(|id, path| client_ids.values().any(|current| current == id) && path.is_file());
+        let missing_ids: HashSet<&str> = client_ids
+            .values()
+            .filter(|id| !self.client_rollout_paths.contains_key(*id))
+            .map(String::as_str)
+            .collect();
+        if !missing_ids.is_empty() {
+            self.client_rollout_paths
+                .extend(Self::find_rollouts_by_id(&self.sessions_dir, &missing_ids));
+        }
+        let mut pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        for (&pid, id) in client_ids {
+            if let Some(path) = self.client_rollout_paths.get(id) {
+                pid_to_jsonl.insert(pid, path.clone());
+            }
+        }
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
 
         let mut sessions = Vec::new();
@@ -191,6 +265,12 @@ impl CodexCollector {
                 &shared.children_map,
                 &shared.ports,
             ) {
+                if client_ids
+                    .get(pid)
+                    .is_some_and(|id| *id != session.session_id)
+                {
+                    continue;
+                }
                 seen_jsonl.insert(jsonl_path.clone());
                 if let Some(new_rl) = rl {
                     let newer = self
@@ -246,28 +326,28 @@ impl CodexCollector {
             }
             Self::sort_rollouts_by_mtime_desc(&mut desktop_rollout_paths);
 
-            let active_fd_rollouts = Self::active_desktop_rollouts(
+            // TUI sessions are discovered by client identity above. A shared
+            // daemon can keep their files open after the terminal exits; those
+            // files alone do not establish that a terminal session is live.
+            let is_desktop = |path: &PathBuf| {
+                read_rollout_originator(path)
+                    .is_some_and(|originator| originator == "Codex Desktop")
+            };
+            desktop_rollout_paths.retain(is_desktop);
+
+            let mut active_fd_rollouts = Self::active_desktop_rollouts(
                 desktop_pid_to_rollouts.clone(),
                 &seen_jsonl,
                 &shared.mcp_owned_rollouts,
                 super::mcp::ACTIVE_MTIME_SECS,
             );
-            let fd_rollout_paths: Vec<PathBuf> = active_fd_rollouts
-                .iter()
-                .map(|(_, path)| path.clone())
-                .collect();
-            let tui_jump_pids = Self::map_codex_tui_jump_pids(
-                &shared.process_info,
-                &fd_rollout_paths,
-                &desktop_rollout_paths,
-            );
+            active_fd_rollouts.retain(|(_, path)| is_desktop(path));
 
             for path in desktop_rollout_paths {
                 let pid = desktop_pid_for_path.get(&path).copied();
-                let jump_pid = tui_jump_pids.get(&path).copied();
                 let process_ctx = CodexProcessContext {
                     pid,
-                    jump_pid,
+                    jump_pid: None,
                     is_exec: false,
                     owns_process_tree: false,
                     unknown_process_owner: pid.is_none(),
@@ -303,7 +383,7 @@ impl CodexCollector {
                 if let Some((session, rl)) = self.load_session_with_rate_limit(
                     CodexProcessContext {
                         pid: Some(pid),
-                        jump_pid: tui_jump_pids.get(&path).copied(),
+                        jump_pid: None,
                         is_exec: false,
                         owns_process_tree: false,
                         unknown_process_owner: false,
@@ -395,7 +475,6 @@ impl CodexCollector {
 
         let helpers = self.helper_session_ids.take();
         sessions.retain(|s| !helpers.contains(&s.session_id));
-        let names = read_session_names(&self.sessions_dir);
         for session in &mut sessions {
             if let Some(name) = names.get(&session.session_id) {
                 session.session_name = name.clone();
@@ -403,6 +482,38 @@ impl CodexCollector {
         }
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         sessions
+    }
+
+    /// Locate known thread IDs by filename without parsing unrelated histories.
+    /// Identified clients are not subject to the recent-mtime cutoff: a live
+    /// terminal can wait for input for hours, including across midnight.
+    fn find_rollouts_by_id(dir: &Path, ids: &HashSet<&str>) -> HashMap<String, PathBuf> {
+        let mut paths = HashMap::new();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return paths;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                paths.extend(Self::find_rollouts_by_id(&entry.path(), ids));
+            } else if kind.is_file() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                    continue;
+                }
+                for &id in ids {
+                    if name.ends_with(&format!("-{id}.jsonl")) {
+                        paths.insert(id.to_string(), entry.path());
+                    }
+                }
+            }
+        }
+        paths
     }
 
     /// Get today's session directory path: ~/.codex/sessions/YYYY/MM/DD
@@ -592,199 +703,6 @@ impl CodexCollector {
         }
     }
 
-    fn map_codex_tui_jump_pids(
-        process_info: &HashMap<u32, ProcInfo>,
-        fd_rollout_paths: &[PathBuf],
-        recent_rollout_paths: &[PathBuf],
-    ) -> HashMap<PathBuf, u32> {
-        Self::map_codex_tui_jump_pids_prefer_open_with_cwds(
-            process_info,
-            fd_rollout_paths,
-            recent_rollout_paths,
-            codex_process_cwd,
-        )
-    }
-
-    fn map_codex_tui_jump_pids_prefer_open_with_cwds(
-        process_info: &HashMap<u32, ProcInfo>,
-        fd_rollout_paths: &[PathBuf],
-        recent_rollout_paths: &[PathBuf],
-        process_cwd: impl Fn(u32) -> Option<String>,
-    ) -> HashMap<PathBuf, u32> {
-        let mut matched =
-            Self::map_codex_tui_jump_pids_with_cwds(process_info, fd_rollout_paths, &process_cwd);
-        let assigned_pids: HashSet<u32> = matched.values().copied().collect();
-        let fd_paths: HashSet<&Path> = fd_rollout_paths.iter().map(PathBuf::as_path).collect();
-        let fallback_paths: Vec<PathBuf> = recent_rollout_paths
-            .iter()
-            .filter(|path| !fd_paths.contains(path.as_path()))
-            .cloned()
-            .collect();
-        let remaining_processes: HashMap<u32, ProcInfo> = process_info
-            .iter()
-            .filter(|(pid, _)| !assigned_pids.contains(pid))
-            .map(|(pid, info)| {
-                (
-                    *pid,
-                    ProcInfo {
-                        pid: info.pid,
-                        ppid: info.ppid,
-                        rss_kb: info.rss_kb,
-                        cpu_pct: info.cpu_pct,
-                        command: info.command.clone(),
-                    },
-                )
-            })
-            .collect();
-        matched.extend(Self::map_codex_tui_jump_pids_with_cwds(
-            &remaining_processes,
-            &fallback_paths,
-            process_cwd,
-        ));
-        matched
-    }
-
-    fn map_codex_tui_jump_pids_with_cwds(
-        process_info: &HashMap<u32, ProcInfo>,
-        rollout_paths: &[PathBuf],
-        process_cwd: impl Fn(u32) -> Option<String>,
-    ) -> HashMap<PathBuf, u32> {
-        let sessions: Vec<(PathBuf, PathBuf)> = rollout_paths
-            .iter()
-            .filter_map(|path| {
-                let result = parse_codex_jsonl(path)?;
-                if !result.is_codex_tui() || result.cwd.is_empty() {
-                    return None;
-                }
-                Some((path.clone(), PathBuf::from(result.cwd)))
-            })
-            .collect();
-        let clients: Vec<(u32, PathBuf)> = Self::codex_client_pids(process_info)
-            .into_iter()
-            .filter_map(|pid| Some((pid, PathBuf::from(process_cwd(pid)?))))
-            .collect();
-
-        let scores: Vec<Vec<Option<usize>>> = sessions
-            .iter()
-            .map(|(_, session_cwd)| {
-                clients
-                    .iter()
-                    .map(|(_, client_cwd)| path_distance(session_cwd, client_cwd))
-                    .collect()
-            })
-            .collect();
-        let mut available_sessions = vec![true; sessions.len()];
-        let mut available_clients = vec![true; clients.len()];
-        let mut matched = HashMap::new();
-        loop {
-            let mut session_best = vec![None; sessions.len()];
-            for session_idx in 0..sessions.len() {
-                if !available_sessions[session_idx] {
-                    continue;
-                }
-                let Some(best) = (0..clients.len())
-                    .filter(|&idx| available_clients[idx])
-                    .filter_map(|idx| scores[session_idx][idx])
-                    .min()
-                else {
-                    continue;
-                };
-                let mut candidates = (0..clients.len()).filter(|&idx| {
-                    available_clients[idx] && scores[session_idx][idx] == Some(best)
-                });
-                let first = candidates.next();
-                if first.is_some() && candidates.next().is_none() {
-                    session_best[session_idx] = first;
-                }
-            }
-            let mut client_best = vec![None; clients.len()];
-            for client_idx in 0..clients.len() {
-                if !available_clients[client_idx] {
-                    continue;
-                }
-                let Some(best) = (0..sessions.len())
-                    .filter(|&idx| available_sessions[idx])
-                    .filter_map(|idx| scores[idx][client_idx])
-                    .min()
-                else {
-                    continue;
-                };
-                let mut candidates = (0..sessions.len()).filter(|&idx| {
-                    available_sessions[idx] && scores[idx][client_idx] == Some(best)
-                });
-                let first = candidates.next();
-                if first.is_some() && candidates.next().is_none() {
-                    client_best[client_idx] = first;
-                }
-            }
-            let pairs: Vec<(usize, usize)> = session_best
-                .iter()
-                .enumerate()
-                .filter_map(|(session_idx, client_idx)| {
-                    let client_idx = (*client_idx)?;
-                    (client_best[client_idx] == Some(session_idx))
-                        .then_some((session_idx, client_idx))
-                })
-                .collect();
-            if pairs.is_empty() {
-                break;
-            }
-            for (session_idx, client_idx) in pairs {
-                available_sessions[session_idx] = false;
-                available_clients[client_idx] = false;
-                matched.insert(sessions[session_idx].0.clone(), clients[client_idx].0);
-            }
-        }
-        matched
-    }
-
-    fn find_closest_codex_client_pid_for_cwd(
-        process_info: &HashMap<u32, ProcInfo>,
-        session_cwd: &str,
-    ) -> Option<u32> {
-        Self::find_closest_codex_client_pid_for_cwd_with(
-            process_info,
-            session_cwd,
-            codex_process_cwd,
-        )
-    }
-
-    fn find_closest_codex_client_pid_for_cwd_with(
-        process_info: &HashMap<u32, ProcInfo>,
-        session_cwd: &str,
-        process_cwd: impl Fn(u32) -> Option<String>,
-    ) -> Option<u32> {
-        let session_cwd = Path::new(session_cwd);
-        let mut closest: Option<(u32, usize)> = None;
-        let mut ambiguous = false;
-        for pid in Self::codex_client_pids(process_info) {
-            let Some(cwd) = process_cwd(pid) else {
-                continue;
-            };
-            let client_cwd = Path::new(&cwd);
-            if !session_cwd.starts_with(client_cwd) {
-                continue;
-            }
-            let distance = session_cwd
-                .components()
-                .count()
-                .saturating_sub(client_cwd.components().count());
-            match closest {
-                None => {
-                    closest = Some((pid, distance));
-                    ambiguous = false;
-                }
-                Some((_, best_distance)) if distance < best_distance => {
-                    closest = Some((pid, distance));
-                    ambiguous = false;
-                }
-                Some((_, best_distance)) if distance == best_distance => ambiguous = true,
-                _ => {}
-            }
-        }
-        (!ambiguous).then(|| closest.map(|(pid, _)| pid)).flatten()
-    }
-
     fn codex_client_pids(process_info: &HashMap<u32, ProcInfo>) -> Vec<u32> {
         let mut candidates: Vec<u32> = process_info
             .values()
@@ -836,10 +754,6 @@ impl CodexCollector {
         let display_pid = process_ctx.pid.unwrap_or(0);
         let jump_pid = if process_ctx.owns_process_tree {
             process_ctx.pid
-        } else if result.is_codex_tui() {
-            process_ctx
-                .jump_pid
-                .or_else(|| Self::find_closest_codex_client_pid_for_cwd(process_info, &result.cwd))
         } else {
             process_ctx.jump_pid
         };
@@ -1227,64 +1141,26 @@ impl CodexJSONLResult {
         matches!(self.originator.as_str(), "Codex Desktop" | "codex-tui")
     }
 
-    fn is_codex_tui(&self) -> bool {
-        self.originator == "codex-tui"
-    }
-
     /// Internal helper threads (guardian approval reviews) are not user sessions.
     fn is_helper_thread(&self) -> bool {
         self.thread_source == "guardian_review"
     }
 }
 
-fn path_distance(left: &Path, right: &Path) -> Option<usize> {
-    if !left.starts_with(right) && !right.starts_with(left) {
-        return None;
-    }
-    Some(
-        left.components()
-            .count()
-            .abs_diff(right.components().count()),
-    )
+/// Inspect only the metadata header when filtering daemon-owned rollouts.
+fn read_rollout_originator(path: &Path) -> Option<String> {
+    read_rollout_metadata(path)?["originator"]
+        .as_str()
+        .map(str::to_string)
 }
 
-#[cfg(target_os = "linux")]
-fn codex_process_cwd(pid: u32) -> Option<String> {
-    fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
-}
-
-#[cfg(target_os = "windows")]
-fn codex_process_cwd(pid: u32) -> Option<String> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-    let mut system = System::new();
-    let pid = Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        false,
-        ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
-    );
-    system
-        .process(pid)
-        .and_then(|process| process.cwd())
-        .map(|path| path.to_string_lossy().into_owned())
-}
-
-#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
-fn codex_process_cwd(pid: u32) -> Option<String> {
-    let output = Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find(|line| line.starts_with('n') && line.len() > 1)
-        .map(|line| line[1..].to_string())
+fn read_rollout_metadata(path: &Path) -> Option<Value> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file).take(10 * 1024 * 1024);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let value: Value = serde_json::from_str(&line).ok()?;
+    (value["type"] == "session_meta").then(|| value["payload"].clone())
 }
 
 fn event_timestamp_ms(val: &Value) -> Option<u64> {
@@ -2343,141 +2219,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_tui_jump_pid_requires_one_client_with_matching_cwd() {
-        let mut process_info = HashMap::new();
-        process_info.insert(10, proc_info(10, 1, "codex resume"));
-        process_info.insert(20, proc_info(20, 1, "codex app-server --managed-daemon"));
-        let process_cwds = HashMap::from([
-            (10, "/home/user/project".to_string()),
-            (20, "/home/user/project".to_string()),
-        ]);
-        let mut rollout = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut rollout, &[TUI_SESSION_META]);
-
-        let pids = CodexCollector::map_codex_tui_jump_pids_with_cwds(
-            &process_info,
-            &[rollout.path().to_path_buf()],
-            |pid| process_cwds.get(&pid).cloned(),
-        );
-
-        assert_eq!(pids.get(rollout.path()), Some(&10));
-    }
-
-    #[test]
-    fn codex_tui_jump_pid_is_unset_when_cwd_matches_multiple_clients() {
-        let mut process_info = HashMap::new();
-        process_info.insert(10, proc_info(10, 1, "codex resume"));
-        process_info.insert(11, proc_info(11, 1, "codex resume"));
-        let process_cwds = HashMap::from([
-            (10, "/home/user/project".to_string()),
-            (11, "/home/user/project".to_string()),
-        ]);
-        let mut rollout = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut rollout, &[TUI_SESSION_META]);
-
-        let pids = CodexCollector::map_codex_tui_jump_pids_with_cwds(
-            &process_info,
-            &[rollout.path().to_path_buf()],
-            |pid| process_cwds.get(&pid).cloned(),
-        );
-
-        assert!(!pids.contains_key(rollout.path()));
-    }
-
-    #[test]
-    fn codex_tui_jump_pid_uses_closest_unique_session_and_client_pairing() {
-        let mut process_info = HashMap::new();
-        process_info.insert(10, proc_info(10, 1, "codex resume"));
-        process_info.insert(11, proc_info(11, 1, "codex resume"));
-        let process_cwds = HashMap::from([
-            (10, "/home/user/workspace/board".to_string()),
-            (11, "/home/user/workspace".to_string()),
-        ]);
-        let mut broad_rollout = tempfile::NamedTempFile::new().unwrap();
-        let broad_meta = TUI_SESSION_META.replace("/home/user/project", "/home/user/workspace");
-        write_lines(&mut broad_rollout, &[&broad_meta]);
-        let mut nested_rollout = tempfile::NamedTempFile::new().unwrap();
-        let nested_meta =
-            TUI_SESSION_META.replace("/home/user/project", "/home/user/workspace/board/mnt");
-        write_lines(&mut nested_rollout, &[&nested_meta]);
-
-        let pids = CodexCollector::map_codex_tui_jump_pids_with_cwds(
-            &process_info,
-            &[
-                broad_rollout.path().to_path_buf(),
-                nested_rollout.path().to_path_buf(),
-            ],
-            |pid| process_cwds.get(&pid).cloned(),
-        );
-
-        assert_eq!(pids.get(broad_rollout.path()), Some(&11));
-        assert_eq!(pids.get(nested_rollout.path()), Some(&10));
-    }
-
-    #[test]
-    fn codex_tui_jump_pid_fallback_uses_most_specific_process_cwd() {
-        let mut process_info = HashMap::new();
-        process_info.insert(10, proc_info(10, 1, "codex resume"));
-        process_info.insert(11, proc_info(11, 1, "codex resume"));
-        process_info.insert(12, proc_info(12, 1, "codex app-server --managed-daemon"));
-        let process_cwds = HashMap::from([
-            (10, "/home/user/workspace/board".to_string()),
-            (11, "/home/user/workspace".to_string()),
-            (12, "/home/user/workspace/board".to_string()),
-        ]);
-
-        let broad_pid = CodexCollector::find_closest_codex_client_pid_for_cwd_with(
-            &process_info,
-            "/home/user/workspace",
-            |pid| process_cwds.get(&pid).cloned(),
-        );
-        let nested_pid = CodexCollector::find_closest_codex_client_pid_for_cwd_with(
-            &process_info,
-            "/home/user/workspace/board/mnt",
-            |pid| process_cwds.get(&pid).cloned(),
-        );
-
-        assert_eq!(broad_pid, Some(11));
-        assert_eq!(nested_pid, Some(10));
-    }
-
-    #[test]
-    fn open_rollouts_keep_matches_from_recent_filesystem_candidates() {
-        let mut process_info = HashMap::new();
-        process_info.insert(10, proc_info(10, 1, "codex resume"));
-        process_info.insert(11, proc_info(11, 1, "codex resume"));
-        let process_cwds = HashMap::from([
-            (10, "/home/user/workspace/board".to_string()),
-            (11, "/home/user/workspace".to_string()),
-        ]);
-        let mut broad_rollout = tempfile::NamedTempFile::new().unwrap();
-        let broad_meta = TUI_SESSION_META.replace("/home/user/project", "/home/user/workspace");
-        write_lines(&mut broad_rollout, &[&broad_meta]);
-        let mut nested_rollout = tempfile::NamedTempFile::new().unwrap();
-        let nested_meta =
-            TUI_SESSION_META.replace("/home/user/project", "/home/user/workspace/board/mnt");
-        write_lines(&mut nested_rollout, &[&nested_meta]);
-        let mut recent_noise = tempfile::NamedTempFile::new().unwrap();
-        let noise_meta =
-            TUI_SESSION_META.replace("/home/user/project", "/home/user/workspace/board");
-        write_lines(&mut recent_noise, &[&noise_meta]);
-
-        let pids = CodexCollector::map_codex_tui_jump_pids_prefer_open_with_cwds(
-            &process_info,
-            &[
-                broad_rollout.path().to_path_buf(),
-                nested_rollout.path().to_path_buf(),
-            ],
-            &[recent_noise.path().to_path_buf()],
-            |pid| process_cwds.get(&pid).cloned(),
-        );
-
-        assert_eq!(pids.get(broad_rollout.path()), Some(&11));
-        assert_eq!(pids.get(nested_rollout.path()), Some(&10));
-        assert!(!pids.contains_key(recent_noise.path()));
-    }
-
-    #[test]
     fn active_rollout_filter_accepts_desktop_and_codex_tui_only() {
         let mut desktop = tempfile::NamedTempFile::new().unwrap();
         write_lines(&mut desktop, &[DESKTOP_SESSION_META]);
@@ -2674,6 +2415,7 @@ mod tests {
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
             helper_session_ids: Default::default(),
+            client_rollout_paths: HashMap::new(),
         };
         let mut shared = super::super::SharedProcessData {
             process_info: HashMap::new(),
@@ -2701,6 +2443,86 @@ mod tests {
         assert_eq!(sessions[0].session_id, "desktop-123");
         assert_eq!(sessions[0].status, SessionStatus::Unknown);
         assert_eq!(sessions[0].current_tasks, vec!["unknown".to_string()]);
+    }
+
+    #[test]
+    fn same_directory_clients_keep_distinct_pids_and_closed_clients_stay_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        let old_day = sessions_dir.join("2020/01/01");
+        let today = sessions_dir.join(chrono::Local::now().format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&old_day).unwrap();
+        fs::create_dir_all(&today).unwrap();
+        let first = old_day.join("rollout-old-tui-first.jsonl");
+        let second = today.join("rollout-new-tui-second.jsonl");
+        write_jsonl(&first, &[&TUI_SESSION_META.replace("tui-123", "tui-first")]);
+        write_jsonl(
+            &second,
+            &[&TUI_SESSION_META.replace("tui-123", "tui-second")],
+        );
+        set_modified(&first, SystemTime::now() - Duration::from_secs(7200));
+        let mut collector = CodexCollector {
+            sessions_dir,
+            last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            helper_session_ids: Default::default(),
+            client_rollout_paths: HashMap::new(),
+        };
+        let mut shared = super::super::SharedProcessData {
+            process_info: HashMap::from([
+                (
+                    900_001,
+                    proc_info(900_001, 1, "codex -C /home/user/project"),
+                ),
+                (
+                    900_002,
+                    proc_info(900_002, 1, "codex -C /home/user/project"),
+                ),
+                (
+                    900_003,
+                    proc_info(900_003, 1, "codex app-server --managed-daemon"),
+                ),
+            ]),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::from([(900_003, vec![first, second])]),
+        };
+        let names = HashMap::from([
+            ("tui-first".into(), "Fix checkout".into()),
+            ("tui-second".into(), "Fix search".into()),
+        ]);
+        let identities = HashMap::from([
+            (900_001, "tui-first".into()),
+            (900_002, "tui-second".into()),
+        ]);
+        let sessions = collector.collect_sessions_with_identity(&shared, &names, &identities);
+        assert_eq!(sessions.len(), 2);
+        for session in sessions {
+            let expected_pid = if session.session_id == "tui-first" {
+                900_001
+            } else {
+                900_002
+            };
+            assert_eq!(session.pid, expected_pid);
+            assert_eq!(session.jump_pid, Some(expected_pid));
+            assert_eq!(session.status, SessionStatus::Waiting);
+            assert_eq!(session.cwd, "/home/user/project");
+        }
+
+        shared.process_info.remove(&900_002);
+        let identities = HashMap::from([(900_001, "tui-first".into())]);
+        let sessions = collector.collect_sessions_with_identity(&shared, &names, &identities);
+        let live: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.status != SessionStatus::Done)
+            .collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].session_id, "tui-first");
+        assert_eq!(live[0].pid, 900_001);
     }
 
     #[test]

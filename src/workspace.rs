@@ -158,7 +158,6 @@ impl Workspace {
                 !live.iter().any(|l| {
                     l.agent_cli == s.agent.cli()
                         && l.session_id == s.id
-                        && l.pid != 0
                         && l.status != SessionStatus::Done
                 }) && (self.agent_filter == 0
                     || (self.agent_filter == 1 && s.agent == Agent::Claude)
@@ -1227,6 +1226,11 @@ mod tests {
             root: "/root".into(),
             modified: 1,
         });
+        assert!(app.workspace.visible(&[live.clone()]).is_empty());
+        // Filesystem-first Codex discovery can temporarily have no owner PID.
+        // A session already on the dashboard still must not be offered to resume.
+        live.pid = 0;
+        live.status = SessionStatus::Unknown;
         assert!(app.workspace.visible(&[live.clone()]).is_empty());
         live.status = SessionStatus::Done;
         assert_eq!(app.workspace.visible(&[live]).len(), 1);

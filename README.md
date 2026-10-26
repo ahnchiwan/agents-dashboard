@@ -186,6 +186,10 @@ Markers are written to `${CLAUDE_CONFIG_DIR:-~/.claude}/abtop-reply-state/<sessi
 
 Press `Enter` on a live session to focus the terminal that runs it. cmux, tmux, and iTerm2 on macOS are supported.
 
+For tmux jumps, run both the dashboard and the agent inside tmux. A session in an ordinary terminal outside these supported backends cannot be focused with `Enter`.
+
+Newer Codex clients can share an app-server that writes their transcripts. The dashboard matches each terminal client using its current tmux thread title or an explicit resume session ID, so multiple sessions can use the same working directory. Keep `thread-name` (included by default) or `session-id` in Codex's terminal title; duplicate names require `session-id` to distinguish them. Closing a client removes its dashboard entry even if the shared server retains the transcript. Live sessions are excluded from Session Archive.
+
 ```bash
 tmux new -s work
 # pane 0: agents-dashboard

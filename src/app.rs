@@ -116,8 +116,8 @@ pub struct App {
     pub orphan_ports: Vec<OrphanPort>,
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
-    /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
-    kill_confirm: Option<(usize, Instant)>,
+    /// Kill confirmation: (session ID, PID, timestamp). Expires after 2s.
+    kill_confirm: Option<(String, u32, Instant)>,
     pub theme: Theme,
     pub show_quota: bool,
     pub show_sessions: bool,
@@ -758,13 +758,22 @@ impl App {
             return;
         }
         let session = &self.sessions[self.selected];
-        if matches!(session.status, SessionStatus::Done | SessionStatus::Unknown) {
+        if matches!(session.status, SessionStatus::Done) {
+            return;
+        }
+        if session.pid == 0 || matches!(session.status, SessionStatus::Unknown) {
+            self.set_status(
+                "Could not uniquely match this session to an agent process".to_string(),
+            );
             return;
         }
 
         // Check if we have a pending confirmation for this exact session
-        if let Some((idx, ts)) = self.kill_confirm.take() {
-            if idx == self.selected && ts.elapsed().as_secs() < 2 {
+        if let Some((id, confirmed_pid, ts)) = self.kill_confirm.take() {
+            if id == session.session_id
+                && confirmed_pid == session.pid
+                && ts.elapsed().as_secs() < 2
+            {
                 // Confirmed — verify PID still runs a killable agent before killing
                 let pid = session.pid;
                 let verified = std::process::Command::new("ps")
@@ -780,10 +789,25 @@ impl App {
                     self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
-                let _ = std::process::Command::new("kill")
+                let result = std::process::Command::new("kill")
                     .args(["-9", &pid.to_string()])
                     .output();
-                self.tick();
+                match result {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => {
+                        self.set_status(format!(
+                            "Could not kill PID {}: {}",
+                            pid,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        self.set_status(format!("Could not kill PID {}: {}", pid, error));
+                        return;
+                    }
+                }
+                self.tick_no_summaries();
                 return;
             }
         }
@@ -794,7 +818,7 @@ impl App {
             .get(&session.session_id)
             .cloned()
             .unwrap_or_else(|| format!("PID {}", session.pid));
-        self.kill_confirm = Some((self.selected, Instant::now()));
+        self.kill_confirm = Some((session.session_id.clone(), session.pid, Instant::now()));
         self.set_status(format!("Press x again to kill: {}", name));
     }
 
@@ -838,28 +862,25 @@ impl App {
 
     /// Jump to the terminal running the selected session's agent process.
     /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
-    /// see [`crate::jump`]. No-op when nothing is selected or no backend
-    /// recognizes the process.
+    /// see [`crate::jump`]. No-op when nothing is selected; unmatched clients
+    /// and unsupported terminals return an error for the status line.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
         let session = &self.sessions[self.selected];
-        let target_pid = session.jump_pid.or_else(|| {
-            (session.agent_cli == "codex")
-                .then(|| {
-                    crate::collector::codex::CodexCollector::resolve_live_client_pid_for_cwd(
-                        &session.cwd,
-                    )
-                })
-                .flatten()
-        });
-        let Some(target_pid) = target_pid else {
+        let Some(target_pid) = session.jump_pid else {
             return JumpOutcome::Failed(
                 "Could not uniquely match this session to a terminal process".to_string(),
             );
         };
-        crate::jump::run_jump(target_pid)
+        match crate::jump::run_jump(target_pid) {
+            JumpOutcome::NoOp => JumpOutcome::Failed(
+                "No supported terminal found for this session; use tmux, cmux, or iTerm2"
+                    .to_string(),
+            ),
+            outcome => outcome,
+        }
     }
 
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"

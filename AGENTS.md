@@ -39,6 +39,7 @@ src/
 │   ├── mod.rs              # MultiCollector orchestration, orphan port detection
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing, Reply markers
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
+│   ├── codex_identity.rs   # Codex daemon clients: session ID / tmux title ownership
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── chat_tools.rs       # Tool call/result rows for the chat history
 │   ├── mcp.rs              # MCP server process detection
@@ -150,9 +151,11 @@ Key line types:
 
 Discovery strategy:
 1. Find running `codex` processes via `ps`
-2. Map PID → open `rollout-*.jsonl` file via `lsof`
+2. Map PID → open `rollout-*.jsonl` file via `lsof` (or `/proc/{pid}/fd` on Linux). For shared app-server clients, match the current tmux pane title to `session_index.jsonl`, or read an explicit `codex resume <session-id>` argument when no pane title is available. On Linux, unnamed new threads can also match a unique process/thread creation interval of at most 5 seconds with equal cwd. This supports multiple sessions sharing one cwd; do not infer ownership from cwd alone.
 3. Parse JSONL for `session_meta`, `token_count` (includes rate_limits), `agent_message` events
 4. Detect finished sessions: scan today's directory for JSONL < 5 min old not owned by running process
+
+Identified clients remain live regardless of transcript age, including across midnight. A shared app-server holding an old TUI rollout open does not prove its terminal client is alive. Do not resurrect closed TUI sessions from daemon file descriptors. Duplicate or truncated thread names must remain unresolved unless a unique session ID is available.
 
 Rate limits extracted from `token_count` events:
 ```json
@@ -306,6 +309,7 @@ cargo run -- --once            # Print snapshot and exit
 cargo run -- --setup           # Install StatusLine hook for rate limit collection
 cargo run -- --exit-on-jump    # Quit after Enter-jumping to a session terminal (for popup overlays)
 cargo test                     # Tests
+cargo test --test codex_tmux -- --ignored  # Local tmux integration; uses fake agents, no API
 cargo clippy                   # Lint
 ```
 

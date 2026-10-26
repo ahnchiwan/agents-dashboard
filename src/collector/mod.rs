@@ -1,6 +1,7 @@
 pub(crate) mod chat_tools;
 pub mod claude;
 pub mod codex;
+mod codex_identity;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
