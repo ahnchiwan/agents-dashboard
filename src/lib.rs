@@ -104,6 +104,12 @@ pub fn run() -> io::Result<()> {
         return run_update();
     }
 
+    // --setup-reply installs permission-status hooks without changing StatusLine.
+    if std::env::args().any(|a| a == "--setup-reply") {
+        setup::run_reply_setup()?;
+        return Ok(());
+    }
+
     // --setup flag: configure StatusLine hook and exit
     if std::env::args().any(|a| a == "--setup") {
         setup::run_setup();

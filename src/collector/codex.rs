@@ -199,12 +199,21 @@ impl CodexCollector {
             }
         }
         let clients = Self::codex_client_pids(&shared.process_info);
+        let discovery = super::codex_identity::discover(&shared.process_info, &clients, &names);
         #[allow(unused_mut)]
-        let mut client_ids =
-            super::codex_identity::discover(&shared.process_info, &clients, &names);
+        let mut client_ids = discovery.session_ids;
         #[cfg(target_os = "linux")]
         super::codex_identity::discover_startups(&clients, &startups, &mut client_ids);
-        self.collect_sessions_with_identity(shared, &names, &client_ids)
+        let mut sessions = self.collect_sessions_with_identity(shared, &names, &client_ids);
+        for session in &mut sessions {
+            if discovery.awaiting_input_pids.contains(&session.pid)
+                && !matches!(session.status, SessionStatus::Unknown | SessionStatus::Done)
+            {
+                session.status = SessionStatus::AwaitingInput;
+                session.current_tasks = vec!["waiting for input or permission".to_string()];
+            }
+        }
+        sessions
     }
 
     fn collect_sessions_with_identity(
@@ -1502,7 +1511,12 @@ fn output_reports_process_exit(output: &str) -> bool {
 }
 
 fn tool_waits_for_user(name: &str) -> bool {
-    matches!(name, "request_user_input" | "AskUserQuestion")
+    let name = name.rsplit("__").next().unwrap_or(name);
+    let name = name.rsplit('.').next().unwrap_or(name);
+    matches!(
+        name,
+        "request_user_input" | "request_permissions" | "AskUserQuestion"
+    )
 }
 
 /// Async question tools return immediately; the question stays open until the
@@ -1683,6 +1697,18 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                         result.task_complete = true;
                         result.model_generating = false;
                         result.thinking_since_ms = 0;
+                        result.async_question_pending = false;
+                        let end_ms = event_timestamp_ms(&val).unwrap_or(0);
+                        for id in call_starts.keys().cloned().collect::<Vec<_>>() {
+                            close_codex_tool_call(
+                                &id,
+                                end_ms,
+                                &mut result.tool_calls,
+                                &call_indices,
+                                &mut call_starts,
+                                &mut pending_tasks,
+                            );
+                        }
                     }
                     Some("user_message") => {
                         result.task_complete = false;
@@ -3046,6 +3072,58 @@ mod tests {
             async_question_status(&[rejected, TASK_COMPLETE]),
             SessionStatus::Waiting
         );
+    }
+
+    #[test]
+    fn permission_requests_are_reply_until_granted_denied_or_cancelled() {
+        let collector = CodexCollector::new();
+        let processes = HashMap::from([(42, proc_info(42, 1, "codex"))]);
+        for name in [
+            "request_permissions",
+            "functions.request_permissions",
+            "mcp__server__request_permissions",
+            "functions.request_user_input",
+        ] {
+            for outcome in ["granted", "denied", "cancelled"] {
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                let call = serde_json::json!({"type":"response_item","timestamp":"2026-03-28T15:01:06Z",
+                    "payload":{"type":"function_call","name":name,"arguments":"{}","call_id":"permission-1"}}).to_string();
+                write_lines(&mut file, &[SESSION_META, &call]);
+                let load = || {
+                    collector
+                        .load_session_with_rate_limit(
+                            owned_process(42),
+                            file.path(),
+                            &processes,
+                            &HashMap::new(),
+                            &HashMap::new(),
+                        )
+                        .unwrap()
+                        .0
+                        .status
+                };
+                assert_eq!(load(), SessionStatus::AwaitingInput, "{name}");
+                let event = if outcome == "cancelled" {
+                    serde_json::json!({"type":"event_msg","timestamp":"2026-03-28T15:01:10Z","payload":{"type":"turn_aborted"}})
+                } else {
+                    serde_json::json!({"type":"response_item","timestamp":"2026-03-28T15:01:10Z",
+                        "payload":{"type":"function_call_output","call_id":"permission-1","output":outcome}})
+                };
+                write_lines(&mut file, &[&event.to_string()]);
+                let status = collector
+                    .load_session_with_rate_limit(
+                        owned_process(42),
+                        file.path(),
+                        &processes,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    )
+                    .unwrap()
+                    .0
+                    .status;
+                assert_ne!(status, SessionStatus::AwaitingInput, "{name}: {outcome}");
+            }
+        }
     }
 
     #[test]

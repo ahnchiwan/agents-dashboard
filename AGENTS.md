@@ -26,7 +26,7 @@ src/
 ├── launcher.rs             # tmux new-window launcher for resume/new sessions
 ├── chat_view.rs            # Chat history layout and scroll anchoring
 ├── snapshot.rs             # JSON snapshot (--json, library API)
-├── setup.rs                # StatusLine hook installation (--setup)
+├── setup.rs                # Quota (--setup) and permission Reply (--setup-reply) hooks
 ├── config.rs / theme.rs / locale.rs / demo.rs / host_info.rs
 ├── ui/
 │   ├── mod.rs              # Layout (desktop / compact Work-Usage), mouse hit targets
@@ -235,6 +235,8 @@ File format read by abtop:
 
 The TUI shows these as `Working` (thinking or executing), `Reply` (a question or permission prompt is waiting; see the Reply hook in the README), `Wait`, `Unknown`, and `Done`. High quota usage does not change the status; the legacy `RateLimited` variant is kept only for the JSON contract and renders as `Wait`. The current task is not shown in the table; the selected session's chat history shows what it is doing.
 
+`--setup-reply` installs Claude's observation-only permission hooks, merges existing hook arrays, and backs up changed settings without altering StatusLine or permission rules. Codex explicit `request_permissions` calls use the same `Reply` state as questions. Codex command/file approval dialogs in tmux use the owning client's current `Action Required` title (both blink phases); clear this signal as soon as the title changes, even while an approved tool is still running. Never infer permission waits merely from a pending tool or an escalation argument. Terminal contents must not be captured for this detection.
+
 **Known limitations** (all heuristic):
 - Cannot distinguish model-thinking vs tool-executing vs rate-limit-waiting; Claude permission prompts are only detected with the optional Reply hook
 - "Waiting" may be wrong if a long-running tool (cargo build, npm test) is running
@@ -307,6 +309,7 @@ cargo build                    # Build
 cargo run                      # Run TUI
 cargo run -- --once            # Print snapshot and exit
 cargo run -- --setup           # Install StatusLine hook for rate limit collection
+cargo run -- --setup-reply     # Install Claude permission Reply hooks without replacing StatusLine
 cargo run -- --exit-on-jump    # Quit after Enter-jumping to a session terminal (for popup overlays)
 cargo test                     # Tests
 cargo test --test codex_tmux -- --ignored  # Local tmux integration; uses fake agents, no API

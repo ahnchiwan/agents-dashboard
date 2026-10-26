@@ -65,7 +65,7 @@ Notes:
 
    This writes `abtop-statusline.sh` (requires `python3`) to your Claude config directory (`$CLAUDE_CONFIG_DIR`, or `~/.claude`) and sets it as the `statusLine` command in that directory's `settings.json`. The script saves the rate limits to `abtop-rate-limits.json` after each Claude response. Restart running Claude sessions to activate it. If `settings.json` already has a different `statusLine` command, `--setup` still writes the script but leaves `settings.json` unchanged and exits with an error, because Claude Code runs only one status line; remove that key and rerun, or call the script from your own status line script instead. Codex quota needs no setup: it is read from Codex's own session files after Codex has run once.
 
-3. **Optionally enable `Reply` for Claude permission prompts** with the hook in [Reply detection](#reply-detection-for-claude-permission-prompts). Questions are detected without it.
+3. **Enable `Reply` for Claude permission prompts** with `agents-dashboard --setup-reply`, then restart Claude Code. This preserves existing hooks, StatusLine, and permission rules, and backs up changed settings. Codex permission prompts in tmux are detected automatically from its `Action Required` title; keep the default `activity` title item enabled. See [Reply detection](#reply-detection-for-claude-permission-prompts).
 
 4. **Use the tabs.** Press `Tab` to move between **Agents Dashboard** (live sessions), **Session Archive** (resume with `Enter`), and **New Session** (pick agent, model, and path, then `Enter` on **Create session**). On a live session, `Enter` jumps to its terminal and `PgUp` / `PgDn` scroll its chat history. Press `?` for help and `q` to quit. All keys are listed in [Key bindings](#key-bindings).
 
@@ -77,6 +77,7 @@ agents-dashboard --demo             # Launch with built-in sample data
 agents-dashboard --once             # Print a snapshot with session summaries and exit
 agents-dashboard --json             # Print one JSON snapshot and exit (for scripts/tools)
 agents-dashboard --setup            # Install the Claude rate limit hook (see Quick start)
+agents-dashboard --setup-reply      # Install Claude permission Reply hooks; preserve StatusLine
 agents-dashboard --theme light      # Launch with a specific theme
 agents-dashboard --mouse            # Enable mouse click/scroll navigation
 agents-dashboard --no-mouse         # Disable mouse capture (the default)
@@ -165,7 +166,9 @@ OpenCode support reads the local SQLite database at `~/.local/share/opencode/ope
 
 A Claude session that asks you a question (`AskUserQuestion`) is detected from its transcript. A **permission prompt** is not recorded in the transcript, so it needs an optional hook that leaves a small marker file while the prompt is open. The hook script is [`scripts/claude-reply-hook.sh`](scripts/claude-reply-hook.sh) and requires `bash` and `jq`.
 
-Copy it to `~/.claude/abtop-reply-hook.sh` and register it in `~/.claude/settings.json`, replacing `/home/you` with your home directory:
+Run `agents-dashboard --setup-reply` to install the hook in `$CLAUDE_CONFIG_DIR` or `~/.claude`, then restart Claude Code. The installer merges its hooks with existing entries, preserves StatusLine and permission rules, saves a private backup before changing settings, and can be run again without adding duplicate hooks. The hook only records status; it never grants or denies permission.
+
+For a manual installation, copy it to `~/.claude/abtop-reply-hook.sh` and register it in `~/.claude/settings.json`, replacing `/home/you` with your home directory:
 
 ```json
 {
@@ -181,6 +184,8 @@ Copy it to `~/.claude/abtop-reply-hook.sh` and register it in `~/.claude/setting
 ```
 
 Markers are written to `${CLAUDE_CONFIG_DIR:-~/.claude}/abtop-reply-state/<session_id>` and contain only the tool name, event kind, timestamps, and tool-use ID. `agents-dashboard --setup` separately installs the StatusLine hook that records Claude rate limits.
+
+Codex's `request_permissions` and question tools also show `Reply` until their result arrives or the turn is cancelled. Command and file-edit approvals are detected in tmux from the owning client's `Action Required` title, including both blinking phases. They return to the transcript-derived status when the prompt closes, without waiting for the approved command to finish. Keep `activity` in Codex's terminal title (the default) for this signal; it is unavailable in terminals outside tmux or when that title item is disabled. Only title metadata is read, not the terminal's conversation or prompt contents.
 
 ## Terminal jump
 

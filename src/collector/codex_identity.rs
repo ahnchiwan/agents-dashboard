@@ -94,13 +94,19 @@ fn unique_startups(
         .collect()
 }
 
+#[derive(Default)]
+pub(super) struct Discovery {
+    pub session_ids: HashMap<u32, String>,
+    pub awaiting_input_pids: HashSet<u32>,
+}
+
 pub(super) fn discover(
     processes: &HashMap<u32, ProcInfo>,
     clients: &[u32],
     names: &HashMap<String, String>,
-) -> HashMap<u32, String> {
+) -> Discovery {
     if clients.is_empty() {
-        return HashMap::new();
+        return Discovery::default();
     }
     // Read pane titles only. Do not capture conversation text or send input.
     let panes = Command::new("tmux")
@@ -120,9 +126,52 @@ pub(super) fn discover(
             catalog.entry(id).or_default();
         }
     }
-    match_clients(processes, clients, &catalog, &panes, |pid| {
-        args[&pid].clone()
-    })
+    Discovery {
+        session_ids: match_clients(processes, clients, &catalog, &panes, |pid| {
+            args[&pid].clone()
+        }),
+        awaiting_input_pids: awaiting_input_clients(processes, clients, &panes),
+    }
+}
+
+fn awaiting_input_clients(
+    processes: &HashMap<u32, ProcInfo>,
+    clients: &[u32],
+    panes: &str,
+) -> HashSet<u32> {
+    let mut waiting = HashSet::new();
+    for line in panes.lines() {
+        let Some((pid, title)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(pane_pid) = pid.parse() else {
+            continue;
+        };
+        // Codex alternates these prefixes while a permission, question, or
+        // other blocking input prompt is open. The title clears on a decision,
+        // before a potentially long-running approved command completes.
+        let title = title.trim_start_matches(|c: char| c.is_whitespace() || c == '●');
+        if !["[ ! ] Action Required", "[ . ] Action Required"]
+            .iter()
+            .any(|prefix| {
+                title
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+            })
+        {
+            continue;
+        }
+        let mut owners = clients
+            .iter()
+            .copied()
+            .filter(|pid| *pid == pane_pid || process::is_descendant_of(*pid, pane_pid, processes));
+        if let Some(owner) = owners.next() {
+            if owners.next().is_none() {
+                waiting.insert(owner);
+            }
+        }
+    }
+    waiting
 }
 
 fn match_clients(
@@ -492,6 +541,38 @@ mod tests {
             vec!["codex".into(), "resume".into(), "Fix checkout".into()]
         });
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn action_required_titles_track_only_the_owning_client_and_clear() {
+        let clients = [11, 20];
+        for prefix in [
+            "[ ! ] Action Required",
+            "[ . ] Action Required",
+            "● [ ! ] Action Required",
+        ] {
+            let panes = format!("10\t{prefix} Fix checkout | project\n20\tFix search | project\n");
+            assert_eq!(
+                awaiting_input_clients(&processes(), &clients, &panes),
+                HashSet::from([11])
+            );
+            assert_eq!(
+                match_clients(&processes(), &clients, &names(), &panes, |_| vec![]).len(),
+                2
+            );
+        }
+        let panes = "10\tFix checkout | project\n20\tFix search | project\n";
+        assert!(awaiting_input_clients(&processes(), &clients, panes).is_empty());
+        assert!(
+            awaiting_input_clients(&processes(), &clients, "10\tWorking | Action Required\n")
+                .is_empty()
+        );
+        let mut procs = processes();
+        procs.get_mut(&20).unwrap().ppid = 10;
+        assert!(
+            awaiting_input_clients(&procs, &clients, "10\t[ ! ] Action Required | project\n")
+                .is_empty()
+        );
     }
 
     #[cfg(target_os = "linux")]

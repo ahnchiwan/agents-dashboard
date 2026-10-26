@@ -179,6 +179,47 @@ while IFS= read -r line; do :; done
     }
     assert!(app.workspace.visible(&app.sessions).is_empty());
 
+    // Permission prompts live in the TUI rather than the rollout. Both blink
+    // phases must remain Reply, and an approval/denial must clear it without a
+    // transcript write. Another session in the same cwd remains unaffected.
+    for prefix in ["[ ! ] Action Required", "[ . ] Action Required"] {
+        lab.tmux(&[
+            "select-pane",
+            "-t",
+            "check:first.0",
+            "-T",
+            &format!("{prefix} Fix checkout | project"),
+        ]);
+        app.tick_no_summaries();
+        assert_eq!(
+            app.sessions
+                .iter()
+                .find(|s| s.session_id == ids[0])
+                .unwrap()
+                .status,
+            SessionStatus::AwaitingInput
+        );
+        assert_eq!(
+            app.sessions
+                .iter()
+                .find(|s| s.session_id == ids[1])
+                .unwrap()
+                .status,
+            SessionStatus::Waiting
+        );
+    }
+    lab.tmux(&[
+        "select-pane",
+        "-t",
+        "check:first.0",
+        "-T",
+        "Fix checkout | project",
+    ]);
+    app.tick_no_summaries();
+    assert!(app
+        .sessions
+        .iter()
+        .all(|s| s.status == SessionStatus::Waiting));
     for (id, window) in ids.iter().zip(["first", "second"]) {
         app.selected = app
             .sessions
